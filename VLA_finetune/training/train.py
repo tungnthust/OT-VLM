@@ -65,6 +65,8 @@ def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_w
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
 
     loss_m = AverageMeter()
+    sim_loss_m = AverageMeter()
+    ot_loss_m = AverageMeter()
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
@@ -75,9 +77,6 @@ def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_w
         step = num_batches_per_epoch * epoch + i
         scheduler(step)
         images, texts = batch
-
-        # print(f"Images shape is {images.shape}") #[128, 3, 3, 224, 224]
-        # print(f"Texts shape is {texts.shape}") #[128, 3, 77]
 
         images = images.to(device=device, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
@@ -92,46 +91,36 @@ def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_w
         text_features_list = []
         local_image_features_list = []
         local_text_features_list = []
+        local_images_features_list = []
+        local_text_features_list = []
         # Subject, Object, Action
         channels = 3
 
         with autocast():
             for k in range(channels):
-                image_channel = images[:, k, :, :, :] # 128,3,224,224
-                text_channel = texts[:, k, :] # 128,1,77 (tokens)
+                image_channel = images[:, k, :, :, :]
+                text_channel = texts[:, k, :]
                 
                 if args.flava:
                     image_channel_features = model.module.get_image_features(pixel_values=image_channel)[:, 0]
                     text_channel_features = model.module.get_text_features(input_ids=text_channel)[:, 0]
                     logit_scale = math.exp(model.module.logit_scale)
                 else:
-                    image_channel_features, text_channel_features, logit_scale = model(image_channel, text_channel)
-                    local_image_features_list.append(local_image_channel_features)
-                    local_text_features_list.append(local_text_channel_features)
-
-                image_features_list.append(image_channel_features)
-                text_features_list.append(text_channel_features)
-                # print(f"image_channel_features shape for channel {k} is {image_channel_features.shape}") #[128, 512]
-                # print(f"text_channel_features shape for channel {k}  is {text_channel_features.shape}") #[128, 512]
-                # print(f"logit_scale shape is {logit_scale.shape}")
-                image_features_list.append(image_channel_features)
-                text_features_list.append(text_channel_features)
-
-
-                ###Prepare OT code
-                # sim = image_channel_features *  text_channel_features  # shape = 128,512 (mog muốn sim: 128, 512,512???)
+                    image_channel_features, text_channel_features, logit_scale = model(image_channel, text_channel, mode="train")
+        
+                image_features_list.append(image_channel_features[0])
+                local_images_features_list.append(image_channel_features[1])
+                text_features_list.append(text_channel_features[0])
+                local_text_features_list.append(text_channel_features[1])
             
             # Stack the features along dimension 1 (the channel dimension)
-            image_features = torch.stack(image_features_list, dim=1) # shape (128,3,512)
-            text_features = torch.stack(text_features_list, dim=1) # shape (128,3,512)
-            # print(f"image_channel_features shape after stacking is {image_channel_features.shape}")
-            # print(f"text_channel_features shape after stacking  is {text_channel_features.shape}")
-            
-            local_image_features = torch.stack(local_image_features_list,dim = 1)
-            local_text_features = torch.stack(local_text_features_list, dim = 1)
+            image_features = torch.stack(image_features_list, dim=1)
+            text_features = torch.stack(text_features_list, dim=1)
+            local_image_features = torch.stack(local_images_features_list, dim=1)
+            local_text_features = torch.stack(local_text_features_list, dim=1)
 
-            total_loss = loss(image_features, text_features, logit_scale, local_image_features,local_text_features)
-            # print(f"Total_loss shape is {total_loss.shape}") #A number
+            total_loss, sim_loss, ot_loss = loss(image_features, text_features, local_image_features, local_text_features, logit_scale)
+
         if scaler is not None:
             scaler.scale(total_loss).backward()
             if args.horovod:
@@ -174,7 +163,8 @@ def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_w
 
             # NOTE loss is coarsely sampled, just master node and per log update
             loss_m.update(total_loss.item(), batch_size)
-
+            sim_loss_m.update(sim_loss.item(), batch_size)
+            ot_loss_m.update(ot_loss.item(), batch_size)
             if args.flava:
                 logit_scale_scalar = logit_scale
             else:
@@ -182,6 +172,8 @@ def train_one_epoch(model, data, epoch, optimizer, scaler, scheduler, args, tb_w
             logging.info(
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
                 f"Loss: {loss_m.val:#.5g} ({loss_m.avg:#.4g}) "
+                f"Sim Loss: {sim_loss_m.val:#.5g} ({sim_loss_m.avg:#.4g}) "
+                f"OT Loss: {ot_loss_m.val:#.5g} ({ot_loss_m.avg:#.4g}) "
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {args.batch_size*args.world_size / batch_time_m.val:#g}/s "
                 f"LR: {optimizer.param_groups[0]['lr']:5f} "

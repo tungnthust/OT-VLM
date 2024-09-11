@@ -14,23 +14,7 @@ try:
 except ImportError:
     hvd = None
 
-def Sinkhorn(K, u, v):
-        r = torch.ones_like(u)
-        c = torch.ones_like(v)
-        thresh = 1e-2
-        max_iter = 100
-        
-        for i in range(max_iter):
-            r0 = r
-            r = u / torch.matmul(K, c.unsqueeze(-1)).squeeze(-1)
-            c = v / torch.matmul(K.permute(0, 2, 1).contiguous(), r.unsqueeze(-1)).squeeze(-1)
-            err = (r - r0).abs().mean()
-            if err.item() < thresh:
-                break
 
-        T = torch.matmul(r.unsqueeze(-1), c.unsqueeze(-2)) * K
-
-        return T
 def gather_features(
         image_features,
         text_features,
@@ -100,67 +84,96 @@ class ClipLoss(nn.Module):
         # cache state
         self.prev_num_logits = 0
         self.labels = {}
+        self.eps = 0.1
+        self.max_iter = 100
 
-    def forward(self, image_features, text_features, logit_scale, local_image_features, local_text_features):
-        
-        # print(f"Local image features: {local_image_features.shape}") #[4, 3, 49, 512]
-        # print(f"Local text features: {local_text_features.shape}")   #[4, 3, 76, 512]
-        ot_loss = 0
+    def Sinkhorn(self, K, u, v):
+        r = torch.ones_like(u)
+        c = torch.ones_like(v)
+        thresh = 1e-2
+        for i in range(self.max_iter):
+            r0 = r
+            r = u / torch.matmul(K, c.unsqueeze(-1)).squeeze(-1)
+            c = v / torch.matmul(K.permute(0, 2, 1).contiguous(), r.unsqueeze(-1)).squeeze(-1)
+            err = (r - r0).abs().mean()
+            if err.item() < thresh:
+                break
+
+        T = torch.matmul(r.unsqueeze(-1), c.unsqueeze(-2)) * K
+
+        return T
+
+    def forward(self, image_features, text_features, local_image_features, local_text_features, logit_scale):
         device = image_features.device
         # Subject, Object, Action
         channels = 3
         logits_per_image_list = []
         logits_per_text_list = []
-
+        logits_ot_list = []
+        b = image_features.shape[0]
         if self.world_size > 1:
             all_image_features, all_text_features = gather_features(
                 image_features, text_features,
                 self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
 
+            all_local_image_features, all_local_text_features = gather_features(
+                local_image_features, local_text_features,
+                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
+
         for i in range(channels):
             image_channel = image_features[:, i, :]
             text_channel = text_features[:, i, :]
-            local_image_channel = local_image_features[:,i,:,:] # shape = [4,49,512]
-            local_text_channel = local_text_features[:,i,:,:]  #shape = [4,76,512]
-            local_image_channel =  F.normalize(local_image_channel, dim=2)
-            local_text_channel = F.normalize(local_text_channel,dim=2)
-            sim  = torch.einsum('mbd,mcd->mbc', local_image_channel, local_text_channel).contiguous() #shape= [4,49,76] --> chỗ này cần [4,4,49,76]
-            wdist = 1.0 - sim
-            xx=torch.zeros(local_image_channel.shape[0],local_image_channel.shape[1], dtype=sim.dtype, device=sim.device).fill_(1. / 49) #shape 128*100, 49 = 128000, 49
-            yy=torch.zeros(local_text_channel.shape[0],local_text_channel.shape[1], dtype=sim.dtype, device=sim.device).fill_(1. / 76) #shape = 128000, 4
-            eps = 0.1
-            max_iter = 100
-                    
-
-            with torch.no_grad():
-                KK = torch.exp(-wdist / eps)
-                T = Sinkhorn(KK,xx,yy)  #shape 12800,49,4
-            if torch.isnan(T).any():
-                print("None")
-            sim_op = torch.sum(T * sim, dim=(1, 2))
-            print(f"Shape of sim_op is {sim_op}")
-            ot_loss += torch.sum(sim_op)
-            if self.world_size > 1: # = 1
+            local_image_channel = local_image_features[:, i, :, :]   #local_image_features = [batchsize, 3,gridsize,dimension] = (128,3,49,512)
+            local_text_channel = local_text_features[:, i, :, :]    #local_text_channel = [batchsize,3,n_ctx(77), dimension] = (128,3,76,512)
+            M = local_image_channel.shape[1]
+            N = local_text_channel.shape[1]
+            if self.world_size > 1:
                 all_image_channel = all_image_features[:, i, :]
                 all_text_channel = all_text_features[:, i, :]
+                all_local_image_channel = all_local_image_features[:, i, :, :]
+                all_local_text_channel = all_local_text_features[:, i, :, :]
 
-                if self.local_loss: #False
+                
+                if self.local_loss:
                     logits_per_image_channel = logit_scale * image_channel @ all_text_channel.T
                     logits_per_text_channel = logit_scale * text_channel @ all_image_channel.T
+                    sim = torch.einsum('mbd,ncd->mnbc', all_local_image_channel.permute(1, 0, 2), all_local_text_channel.permute(1, 0, 2)).contiguous()
                 else:
                     logits_per_image_channel = logit_scale * all_image_channel @ all_text_channel.T
                     logits_per_text_channel = logits_per_image_channel.T
-            else: #Run this
+                    sim = torch.einsum('mbd,ncd->mnbc', all_local_image_channel.permute(1, 0, 2), all_local_text_channel.permute(1, 0, 2)).contiguous() 
+                M = all_local_image_channel.shape[1]
+                N = all_local_text_channel.shape[1]
+            else:
                 logits_per_image_channel = logit_scale * image_channel @ text_channel.T
                 logits_per_text_channel = logit_scale * text_channel @ image_channel.T
+                sim = torch.einsum('mbd,ncd->mnbc', local_image_channel.permute(1, 0, 2), local_text_channel.permute(1, 0, 2)).contiguous() 
+
+            sim = sim.view(M, N, (b*self.world_size)*(b*self.world_size))
+            sim = sim.permute(2,0,1)
+            wdist = 1.0 - sim
+            xx=torch.zeros((b*self.world_size)*(b*self.world_size), M, dtype=sim.dtype, device=sim.device).fill_(1. / M)
+            yy=torch.zeros((b*self.world_size)*(b*self.world_size), N, dtype=sim.dtype, device=sim.device).fill_(1. / N)
+
+            with torch.no_grad():
+                KK = torch.exp(-wdist / self.eps)
+                T = self.Sinkhorn(KK,xx,yy)
+            if torch.isnan(T).any():
+                return None
+
+
+            sim_op = torch.sum(T * sim, dim=(1, 2))
+            sim_op = sim_op.contiguous().view(b*self.world_size, b*self.world_size)
+            logits_ot = logit_scale * sim_op
 
             logits_per_image_list.append(logits_per_image_channel)
             logits_per_text_list.append(logits_per_text_channel)
+            logits_ot_list.append(logits_ot)
 
         # Taking the mean of the logits computed for each channel
         logits_per_image = sum(logits_per_image_list) / channels
         logits_per_text = sum(logits_per_text_list) / channels
-
+        logits_ot = sum(logits_ot_list) / channels
 
         # calculated ground-truth and cache if enabled
         num_logits = logits_per_image.shape[0]
@@ -173,11 +186,13 @@ class ClipLoss(nn.Module):
                 self.prev_num_logits = num_logits
         else:
             labels = self.labels[device]
-        print(f"OT loss is: {ot_loss}")
-        total_loss = (
+
+        ot_loss = F.cross_entropy(logits_ot, labels) 
+        print(f'OT loss: {ot_loss}')
+        sim_loss = (
             F.cross_entropy(logits_per_image, labels) +
             F.cross_entropy(logits_per_text, labels)
-            ) / 2 + ot_loss
-        print(f"Shape of total_loss: {total_loss.shape}")
-        print(f"total_loss: {total_loss}")
-        return total_loss
+            ) / 2
+        print(f'Similarity loss: {sim_loss}')
+        total_loss = 0.1 * ot_loss + sim_loss
+        return total_loss, sim_loss, ot_loss

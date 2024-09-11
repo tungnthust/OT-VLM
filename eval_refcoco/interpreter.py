@@ -9,6 +9,8 @@ from PIL import Image
 import itertools
 import spacy
 import time
+import gc
+from memory_profiler import profile
 
 # Do two line segments intersect? Copied from
 # https://stackoverflow.com/questions/3838329/how-can-i-check-if-two-segments-intersect
@@ -271,7 +273,7 @@ class Environment:
                 box_pairs = original_box_pairs
                 
             sub_sim = self.executor(sub, self.image, boxes, image_name=self.image_name)
-            action_sim = self.executor(action, self.image, box_pairs, image_name=self.image_name)
+            # action_sim = self.executor(action, self.image, box_pairs, image_name=self.image_name)
             obj_sim = self.executor(obj, self.image, boxes, image_name=self.image_name)
 
             for idx, pair in enumerate(original_candidate_pair_indices):
@@ -285,6 +287,7 @@ class Environment:
                     # matrix.append((sub_sim[sub_idx] + action_sim[act_idx] + obj_sim[obj_idx])/3)
                     matrix.append((sub_sim[sub_idx] + obj_sim[obj_idx])/2)
             pair_matrix.append(torch.stack(matrix))
+            
         pair_matrix = torch.stack(pair_matrix)
         textual_pairs_pred_index = pair_matrix.argmax(dim=1)
 
@@ -306,6 +309,7 @@ class Environment:
             instance_score[idx] += pair_score[i]
         
         result = instance_score.softmax(dim=-1)
+       
         return result.cpu().numpy()
 
     def filter_area(self, area_threshold: float) -> np.ndarray:

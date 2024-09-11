@@ -7,6 +7,7 @@ import sys
 import torch
 from PIL import Image
 from tqdm import tqdm
+# import tracemalloc
 
 from interpreter import *
 from executor import *
@@ -113,6 +114,8 @@ if __name__ == "__main__":
     batch_sentences = []
     pbar_data = tqdm(data)
     for datum in pbar_data:
+        # tracemalloc.start()
+
         if "coco" in datum["file_name"].lower():
             file_name = "_".join(datum["file_name"].split("_")[:-1])+".jpg"
         else:
@@ -194,6 +197,19 @@ if __name__ == "__main__":
             total_count += 1
             print(f"est_acc: {100 * correct_count / total_count:.3f}")
             pbar_data.set_description(f"acc: {100 * correct_count / total_count:.3f} - count: {total_count}")
+            # snapshot = tracemalloc.take_snapshot()
+
+            # # Get top statistics for memory usage
+            # top_stats = snapshot.statistics('lineno')
+
+            # # Display the top memory consumers
+            # print("[ Top memory consumers ]")
+            # for stat in top_stats[:10]:  # Show top 10 memory-consuming lines
+            #     print(stat)
+            del env
+            del method
+            gc.collect()
+            method = METHODS_MAP[args.method](args)
 
     if args.output_file:
         output_file.close()

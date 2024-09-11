@@ -519,17 +519,13 @@ class VisualTransformer(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        local_feature = self.ln_post(x[:,1:,])  #[4, 49, 768]
-        # print(f"Shape of local feature in ViT is: {local_feature.shape}")
-        x = self.ln_post(x[:, 0, :]) #[4, 768]
-        # print(f"Shape of CLS token before projection is: {x.shape}")
-
+        local_feature = self.ln_post(x[:,1:,])
+        x = self.ln_post(x[:, 0, :])
         if self.proj is not None:
-            x = x @ self.proj #[4, 512]
-            local_feature = local_feature @ self.proj #[4, 49, 512]
-            # print(f"Shape of local feature in ViT after projection is: {local_feature.shape}")
-            # print(f"Shape of CLS token after projection is: {x.shape}")
-        return x, local_feature
+            x = x @ self.proj
+            local_feature = local_feature @ self.proj
+        # return x
+        return F.normalize(x, dim=-1), F.normalize(local_feature, dim=-1)
 
 
 @dataclass
@@ -685,29 +681,28 @@ class CLIP(nn.Module):
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x)
 
+        local_feature = x[torch.arange(x.shape[0]), :-1]
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
-        local_feature = x[torch.arange(x.shape[0]), :-1] #[4, 76, 512]
-        # print(f"Shape of text local feature is: {local_feature.shape}")
-        # print(f"Shape of CLS token before projection is: {x[torch.arange(x.shape[0]), text.argmax(dim=-1)].shape}") #[4,512]
-        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection #[4,512]
-        # print(f"Shape of CLS token is: {x.shape}")
-        local_feature = local_feature @ self.text_projection ##[4, 76, 512]
-        # print(f"Shape of text local feature after projection is: {local_feature.shape}")
-        return x, local_feature
-        
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        local_feature = local_feature @ self.text_projection
 
-    def forward(self, image, text):
+        # return x
+        return F.normalize(x, dim=-1), F.normalize(local_feature, dim=-1)
+
+    def forward(self, image, text, mode="eval"):
         if image is None:
             return self.encode_text(text)
         elif text is None:
             return self.encode_image(image)
         image_features = self.encode_image(image)
-        image_features = F.normalize(image_features, dim=-1)
+        # image_features = F.normalize(image_features, dim=-1)
 
         text_features = self.encode_text(text)
-        text_features = F.normalize(text_features, dim=-1)
-
+        # text_features = F.normalize(text_features, dim=-1)
+        # if mode == "eval":
+        # return image_features[0], text_features[0], self.logit_scale.exp()
+        # else:   
         return image_features, text_features, self.logit_scale.exp()
 
 

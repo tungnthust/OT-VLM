@@ -14,9 +14,11 @@ import ruamel.yaml as yaml
 from peft import get_peft_model
 from peft import LoraConfig, TaskType
 from interpreter import Box
-
+import tracemalloc
+from memory_profiler import profile
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import gc
 import sys
 import os
 from transformers import FlavaFeatureExtractor, FlavaModel, BertTokenizer
@@ -26,6 +28,79 @@ sys.path.append(base_path)
 
 
 from VLA_finetune.open_clip import create_model_and_transforms
+
+# @profile
+def box_crop_process(i, bbox, image, enlarge_boxes, preprocesses):
+    image_i = Image.fromarray(np.array(image))
+    box = [
+        max(bbox.left-enlarge_boxes, 0),
+        max(bbox.top-enlarge_boxes, 0),
+        min(bbox.right+enlarge_boxes, image_i.width),
+        min(bbox.bottom+enlarge_boxes, image_i.height)
+    ]
+    image_i = image_i.crop(box)
+    results = [preprocess(image_i) for preprocess in preprocesses]
+    preprocessed_images = results[0]
+    del image, image_i, results, bbox, box, enlarge_boxes, preprocesses
+    # gc.collect()
+    # for j, img in enumerate(preprocessed_images):
+    return i, preprocessed_images
+
+# @profile
+def tuple_box_crop_process(i, bbox, image, enlarge_boxes, preprocesses):
+    box1, box2 = bbox  # Unpack the tuple
+    image_i = Image.fromarray(np.array(image))
+    # Compute the union of both boxes
+    union_box = box1.min_bounding(box2)
+    # Now create the bounding box for cropping with enlargement if necessary
+    box = [
+        max(union_box.left - enlarge_boxes, 0),
+        max(union_box.top - enlarge_boxes, 0),
+        min(union_box.right + enlarge_boxes, image_i.width),
+        min(union_box.bottom + enlarge_boxes, image_i.height)
+    ]
+    image_i = image_i.crop(box)
+    results = [preprocess(image_i) for preprocess in preprocesses]
+    preprocessed_images = results[0]
+    del image, image_i, results, bbox, box, enlarge_boxes, preprocesses, union_box
+    # gc.collect()
+    return i, preprocessed_images
+
+# @profile
+def blur_process(i, bbox, image, enlarge_boxes, blur_std_dev, preprocesses):
+    # for i in range(len(boxes)):
+    image_i = Image.fromarray(np.array(image))
+    mask = Image.new('L', image_i.size, 0)
+    draw = ImageDraw.Draw(mask)
+    
+    if isinstance(bbox, Box):
+        box = (
+            max(bbox.left - enlarge_boxes, 0),
+            max(bbox.top - enlarge_boxes, 0),
+            min(bbox.right + enlarge_boxes, image_i.width),
+            min(bbox.bottom + enlarge_boxes, image_i.height)
+        )
+        draw.rectangle([box[:2], box[2:]], fill=255)
+    elif isinstance(bbox, tuple):
+        box1, box2 = bbox
+        for b in [box1, box2]:
+            box = (
+                max(b.left - enlarge_boxes, 0),
+                max(b.top - enlarge_boxes, 0),
+                min(b.right + enlarge_boxes, image_i.width),
+                min(b.bottom + enlarge_boxes, image_i.height)
+            )
+            draw.rectangle([box[:2], box[2:]], fill=255)
+
+    blurred = image_i.filter(ImageFilter.GaussianBlur(blur_std_dev))
+    blurred.paste(image_i, mask=mask)
+    
+    # results = self.preprocess_image(blurred)
+    results = [preprocess(blurred) for preprocess in preprocesses]
+    preprocessed_images = results[0]
+    del image, image_i, results, blurred, bbox, mask, draw, enlarge_boxes, preprocesses
+    # gc.collect()
+    return i, preprocessed_images
 
 
 class Executor:
@@ -54,80 +129,36 @@ class Executor:
     def call_model(self, model: torch.nn.Module, images: torch.Tensor, text: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         raise NotImplementedError
     
-    def box_crop_process(self, i, bbox, image):
-        image_i = image.copy()
-        box = [
-            max(bbox.left-self.enlarge_boxes, 0),
-            max(bbox.top-self.enlarge_boxes, 0),
-            min(bbox.right+self.enlarge_boxes, image_i.width),
-            min(bbox.bottom+self.enlarge_boxes, image_i.height)
-        ]
-        image_i = image_i.crop(box)
-        preprocessed_images = self.preprocess_image(image_i)[0]
-        # for j, img in enumerate(preprocessed_images):
-        return i, preprocessed_images.to(self.device)
-
-    def tuple_box_crop_process(self, i, bbox, image):
-        box1, box2 = bbox  # Unpack the tuple
-        image_i = image.copy()
-        # Compute the union of both boxes
-        union_box = box1.min_bounding(box2)
-        # Now create the bounding box for cropping with enlargement if necessary
-        box = [
-            max(union_box.left - self.enlarge_boxes, 0),
-            max(union_box.top - self.enlarge_boxes, 0),
-            min(union_box.right + self.enlarge_boxes, image_i.width),
-            min(union_box.bottom + self.enlarge_boxes, image_i.height)
-        ]
-        image_i = image_i.crop(box)
-        preprocessed_images = self.preprocess_image(image_i)[0]
-        return i, preprocessed_images.to(self.device)
-
-    def blur_process(self, i, bbox, image):
-        # for i in range(len(boxes)):
-        image_i = image.copy()
-        mask = Image.new('L', image_i.size, 0)
-        draw = ImageDraw.Draw(mask)
-        
-        if isinstance(bbox, Box):
-            box = (
-                max(bbox.left - self.enlarge_boxes, 0),
-                max(bbox.top - self.enlarge_boxes, 0),
-                min(bbox.right + self.enlarge_boxes, image_i.width),
-                min(bbox.bottom + self.enlarge_boxes, image_i.height)
-            )
-            draw.rectangle([box[:2], box[2:]], fill=255)
-        elif isinstance(bbox, tuple):
-            box1, box2 = bbox
-            for b in [box1, box2]:
-                box = (
-                    max(b.left - self.enlarge_boxes, 0),
-                    max(b.top - self.enlarge_boxes, 0),
-                    min(b.right + self.enlarge_boxes, image_i.width),
-                    min(b.bottom + self.enlarge_boxes, image_i.height)
-                )
-                draw.rectangle([box[:2], box[2:]], fill=255)
-
-        blurred = image_i.filter(ImageFilter.GaussianBlur(self.blur_std_dev))
-        blurred.paste(image_i, mask=mask)
-        
-        preprocessed_images = self.preprocess_image(blurred)[0]
-        return i, preprocessed_images.to(self.device)
-
+    # @profile
+    
+    # @profile
     def tensorize_inputs(self, caption: str, image: Image, boxes: Union[List[Box], List[Tuple[Box, Box]]], image_name: str = None) -> Tuple[List[torch.Tensor], torch.Tensor]:
         images = []
         for preprocess in self.preprocesses:
             images.append([])
         images[0] = [None] * len(boxes) * 2
+        # future_to_index = None
         if True:
         # if self.cache_path is None or any([not os.path.exists(os.path.join(self.cache_path, model_name, image_name, method_name+".pt")) for model_name in self.model_names for method_name in self.box_representation_method.split(',')]):
             if "crop" in self.box_representation_method:
                 if isinstance(boxes[0], Box):
+                    enlarge_boxes = self.enlarge_boxes
+                    preprocesses = self.preprocesses
                     with ThreadPoolExecutor() as executor:
-                        future_to_index = {executor.submit(self.box_crop_process, i, box, image): i for i, box in enumerate(boxes)}
-                    for future in as_completed(future_to_index):
-                        index, processed_data = future.result()
-                        images[0][index] = processed_data
+                        future_to_index = {executor.submit(box_crop_process, i, box, image, enlarge_boxes, preprocesses): i for i, box in enumerate(boxes)}
+                        for future in as_completed(future_to_index):
+                            result = future.result()
+                            index, processed_data = result
+                            images[0][index] = processed_data.to(self.device)
+                            # page = future_to_index.pop(future)
+                            del index, processed_data, result
+                        
+                    executor.shutdown(wait=True)
+                    del executor
+                    del future_to_index
+
+                    gc.collect()
+                    
                     # for i in range(len(boxes)):
 
                     #     image_i = image.copy()
@@ -143,10 +174,20 @@ class Executor:
                     #     images[0].append(preprocessed_images.to(self.device))
                 elif isinstance(boxes[0], tuple):
                     with ThreadPoolExecutor() as executor:
-                        future_to_index = {executor.submit(self.tuple_box_crop_process, i, box, image): i for i, box in enumerate(boxes)}
-                    for future in as_completed(future_to_index):
-                        index, processed_data = future.result()
-                        images[0][index] = processed_data
+                        enlarge_boxes = self.enlarge_boxes
+                        preprocesses = self.preprocesses
+                        future_to_index = {executor.submit(tuple_box_crop_process, i, box, image, enlarge_boxes, preprocesses): i for i, box in enumerate(boxes)}
+                        for future in as_completed(future_to_index):
+                            result = future.result()
+                            index, processed_data = result
+                            images[0][index] = processed_data.to(self.device)
+                            # page = future_to_index.pop(future)
+                            del index, processed_data, result
+                        
+                    executor.shutdown(wait=True)
+                    del executor
+                    del future_to_index
+                    gc.collect()
                     # for i in range(len(boxes)):
                     #     box1, box2 = boxes[i]  # Unpack the tuple
                     #     image_i = image.copy()
@@ -165,10 +206,21 @@ class Executor:
                     #     images[0].append(preprocessed_images.to(self.device))
             if "blur" in self.box_representation_method:
                 with ThreadPoolExecutor() as executor:
-                        future_to_index = {executor.submit(self.blur_process, i, box, image): i for i, box in enumerate(boxes)}
-                for future in as_completed(future_to_index):
-                    index, processed_data = future.result()
-                    images[0][index + len(boxes)] = processed_data
+                    enlarge_boxes = self.enlarge_boxes
+                    blur_std_dev = self.blur_std_dev
+                    preprocesses = self.preprocesses
+                    future_to_index = {executor.submit(blur_process, i, box, image, enlarge_boxes, blur_std_dev, preprocesses): i for i, box in enumerate(boxes)}
+                    for future in as_completed(future_to_index):
+                        result = future.result()
+                        index, processed_data = result
+                        # page = future_to_index.pop(future)
+                        images[0][index + len(boxes)] = processed_data.to(self.device)
+                        del index, processed_data, result
+                executor.shutdown(wait=True)
+                del executor
+                del future_to_index
+                gc.collect()
+                    
                 # for i in range(len(boxes)):
                 #     image_i = image.copy()
                 #     mask = Image.new('L', image_i.size, 0)
@@ -221,9 +273,13 @@ class Executor:
         else:
             imgs = [[] for _ in self.models]
         text_tensor = self.preprocess_text(caption.lower()).to(self.device)
+        del images
+        gc.collect()
+
         return imgs, text_tensor
 
     @torch.no_grad()
+    # @profile
     def __call__(self, caption: str, image: Image, boxes: List[Box], image_name: str = None) -> torch.Tensor:
         # start = time.time()
         images, text_tensor = self.tensorize_inputs(caption, image, boxes, image_name)
@@ -234,50 +290,50 @@ class Executor:
         box_representation_methods = self.box_representation_method.split(',')
         caption_hash = hashlib.md5(caption.encode('utf-8')).hexdigest()
         for model, images_t, model_name in zip(self.models, images, self.model_names):
-            if self.cache_path is not None:
-                text_cache_path = os.path.join(self.cache_path, model_name, "text"+("_shade" if self.box_representation_method == "shade" else ""))
+            # if self.cache_path is not None:
+            #     text_cache_path = os.path.join(self.cache_path, model_name, "text"+("_shade" if self.box_representation_method == "shade" else ""))
             image_features = None
             text_features = None
-            if self.cache_path is not None and os.path.exists(os.path.join(self.cache_path, model_name)):
-                if os.path.exists(os.path.join(text_cache_path, caption_hash+".pt")):
-                    text_features = torch.load(os.path.join(text_cache_path, caption_hash+".pt"), map_location=self.device)
-                if os.path.exists(os.path.join(self.cache_path, model_name, image_name)):
-                    if all([os.path.exists(os.path.join(self.cache_path, model_name, image_name, method_name+".pt")) for method_name in box_representation_methods]):
-                        try:
-                            image_features = []
-                            for method_name in box_representation_methods:
-                                features = torch.load(os.path.join(self.cache_path, model_name, image_name, method_name+".pt"), map_location=self.device)
-                                image_features.append(torch.stack([
-                                    features[(box.x, box.y, box.w, box.h)] if isinstance(box, Box) \
-                                        else features[(min(box[0].x, box[1].x), min(box[0].y, box[1].y), \
-                                            max(box[0].x + box[0].w, box[1].x + box[1].w) - min(box[0].x, box[1].x), max(box[0].y + box[0].h, box[1].y + box[1].h) - min(box[0].y, box[1].y))]
-                                    for box in boxes
-                                ]))
-                            image_features = torch.stack(image_features)
-                            image_features = image_features.view(-1, image_features.shape[-1])
-                            print("Use cached features")
-                        except KeyError:
-                            image_features = None
-                            pass
+            # if self.cache_path is not None and os.path.exists(os.path.join(self.cache_path, model_name)):
+            #     if os.path.exists(os.path.join(text_cache_path, caption_hash+".pt")):
+            #         text_features = torch.load(os.path.join(text_cache_path, caption_hash+".pt"), map_location=self.device)
+            #     if os.path.exists(os.path.join(self.cache_path, model_name, image_name)):
+            #         if all([os.path.exists(os.path.join(self.cache_path, model_name, image_name, method_name+".pt")) for method_name in box_representation_methods]):
+            #             try:
+            #                 image_features = []
+            #                 for method_name in box_representation_methods:
+            #                     features = torch.load(os.path.join(self.cache_path, model_name, image_name, method_name+".pt"), map_location=self.device)
+            #                     image_features.append(torch.stack([
+            #                         features[(box.x, box.y, box.w, box.h)] if isinstance(box, Box) \
+            #                             else features[(min(box[0].x, box[1].x), min(box[0].y, box[1].y), \
+            #                                 max(box[0].x + box[0].w, box[1].x + box[1].w) - min(box[0].x, box[1].x), max(box[0].y + box[0].h, box[1].y + box[1].h) - min(box[0].y, box[1].y))]
+            #                         for box in boxes
+            #                     ]))
+            #                 image_features = torch.stack(image_features)
+            #                 image_features = image_features.view(-1, image_features.shape[-1])
+            #                 print("Use cached features")
+            #             except KeyError:
+            #                 image_features = None
+            #                 pass
             logits_per_image, logits_per_text, image_features, text_features = self.call_model(model, images_t, text_tensor, image_features=image_features, text_features=text_features)
             all_logits_per_image.append(logits_per_image)
             all_logits_per_text.append(logits_per_text)
-            if self.cache_path is not None and image_name is not None and image_features is not None:
-                image_features = image_features.view(len(box_representation_methods), len(boxes), image_features.shape[-1])
-                if not os.path.exists(os.path.join(self.cache_path, model_name, image_name)):
-                    os.makedirs(os.path.join(self.cache_path, model_name, image_name))
-                for i in range(image_features.shape[0]):
-                    method_name = box_representation_methods[i]
-                    if not os.path.exists(os.path.join(self.cache_path, model_name, image_name, method_name+".pt")):
-                        image_features_dict = {(box.x, box.y, box.w, box.h) if isinstance(box, Box) \
-                            else (min(box[0].x, box[1].x), min(box[0].y, box[1].y), \
-                                            max(box[0].x + box[0].w, box[1].x + box[1].w) - min(box[0].x, box[1].x), max(box[0].y + box[0].h, box[1].y + box[1].h) - min(box[0].y, box[1].y)): image_features[i,j,:].cpu() for j, box in enumerate(boxes)}
-                        torch.save(image_features_dict, os.path.join(self.cache_path, model_name, image_name, method_name+".pt"))
-            if self.cache_path is not None and not os.path.exists(os.path.join(text_cache_path, caption_hash+".pt")) and text_features is not None:
-                assert text_features.shape[0] == 1
-                if not os.path.exists(text_cache_path):
-                    os.makedirs(text_cache_path)
-                torch.save(text_features.cpu(), os.path.join(text_cache_path, caption_hash+".pt"))
+            # if self.cache_path is not None and image_name is not None and image_features is not None:
+            #     image_features = image_features.view(len(box_representation_methods), len(boxes), image_features.shape[-1])
+            #     if not os.path.exists(os.path.join(self.cache_path, model_name, image_name)):
+            #         os.makedirs(os.path.join(self.cache_path, model_name, image_name))
+            #     for i in range(image_features.shape[0]):
+            #         method_name = box_representation_methods[i]
+            #         if not os.path.exists(os.path.join(self.cache_path, model_name, image_name, method_name+".pt")):
+            #             image_features_dict = {(box.x, box.y, box.w, box.h) if isinstance(box, Box) \
+            #                 else (min(box[0].x, box[1].x), min(box[0].y, box[1].y), \
+            #                                 max(box[0].x + box[0].w, box[1].x + box[1].w) - min(box[0].x, box[1].x), max(box[0].y + box[0].h, box[1].y + box[1].h) - min(box[0].y, box[1].y)): image_features[i,j,:].cpu() for j, box in enumerate(boxes)}
+            #             torch.save(image_features_dict, os.path.join(self.cache_path, model_name, image_name, method_name+".pt"))
+            # if self.cache_path is not None and not os.path.exists(os.path.join(text_cache_path, caption_hash+".pt")) and text_features is not None:
+            #     assert text_features.shape[0] == 1
+            #     if not os.path.exists(text_cache_path):
+            #         os.makedirs(text_cache_path)
+            #     torch.save(text_features.cpu(), os.path.join(text_cache_path, caption_hash+".pt"))
 
         all_logits_per_image = torch.stack(all_logits_per_image).sum(0)
         all_logits_per_text = torch.stack(all_logits_per_text).sum(0)
@@ -285,6 +341,9 @@ class Executor:
             all_logits_per_text = all_logits_per_text.view(-1, len(boxes)).max(dim=0, keepdim=True)[0]
         elif self.method_aggregator == "sum":
             all_logits_per_text = all_logits_per_text.view(-1, len(boxes)).sum(dim=0, keepdim=True)
+        del images, text_tensor
+        gc.collect()
+
         return all_logits_per_text.view(-1)
 
 
